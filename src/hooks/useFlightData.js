@@ -1,44 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 
-const POLL_INTERVAL_MS = 10_000; // 10s — OpenSky anonymous rate limit
-// In production: calls Vercel serverless function /api/flights (CORS proxy)
-// In dev: same path works via direct call (Vite dev server is node so no CORS issues)
-const OPENSKY_URL = '/api/flights';
-
-/**
- * OpenSky state vector field indices:
- * 0  icao24
- * 1  callsign
- * 2  origin_country
- * 3  time_position
- * 4  last_contact
- * 5  longitude
- * 6  latitude
- * 7  baro_altitude
- * 8  on_ground
- * 9  velocity
- * 10 true_track (heading)
- * 11 vertical_rate
- * 12 sensors
- * 13 geo_altitude
- * 14 squawk
- * 15 spi
- * 16 position_source
- */
-function parseState(sv) {
-  return {
-    icao24: sv[0],
-    callsign: sv[1]?.trim() || sv[0],
-    country: sv[2] || 'Unknown',
-    longitude: sv[5],
-    latitude: sv[6],
-    altitude: sv[7],     // baro altitude in metres
-    onGround: sv[8],
-    velocity: sv[9],     // m/s
-    heading: sv[10],
-    verticalRate: sv[11],
-  };
-}
+const POLL_INTERVAL_MS = 10_000; // 10s poll
+const OPENSKY_URL = '/api/flights';  // Vercel serverless proxy (dev + prod)
 
 export function useFlightData() {
   const [flights, setFlights] = useState([]);
@@ -62,15 +25,14 @@ export function useFlightData() {
         headers: { 'Accept': 'application/json' },
       });
 
-      if (!res.ok) throw new Error(`OpenSky API error: ${res.status} ${res.statusText}`);
+      if (!res.ok) throw new Error(`API error: ${res.status} ${res.statusText}`);
 
       const data = await res.json();
-      const states = data?.states ?? [];
 
-      // Filter out entries with no position and parse
-      const parsed = states
-        .filter(sv => sv[5] !== null && sv[6] !== null)
-        .map(parseState);
+      // Serverless function returns { time, count, flights: [...] }
+      // Each flight already has: icao24, callsign, country, longitude, latitude,
+      // altitude, onGround, velocity, heading, verticalRate
+      const parsed = data?.flights ?? [];
 
       setFlights(parsed);
       setLastUpdated(new Date());
@@ -87,9 +49,7 @@ export function useFlightData() {
 
   useEffect(() => {
     fetchFlights(true);
-
     timerRef.current = setInterval(() => fetchFlights(false), POLL_INTERVAL_MS);
-
     return () => {
       clearInterval(timerRef.current);
       if (abortRef.current) abortRef.current.abort();

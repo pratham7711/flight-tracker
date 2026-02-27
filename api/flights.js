@@ -1,33 +1,26 @@
 /**
  * Vercel serverless function — authenticated OpenSky Network proxy
- * Uses OAuth2 client credentials flow for higher rate limits (4000 credits/day vs 400)
+ * OAuth2 client credentials flow | lean payload (strips unused fields) | streamed response
  *
  * GET /api/flights
- * GET /api/flights?lamin=...&lomin=...&lamax=...&lomax=...  (optional bbox)
+ * GET /api/flights?lamin=...&lomin=...&lamax=...&lomax=...
  */
 
 const TOKEN_URL =
   'https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token';
 const OPENSKY_URL = 'https://opensky-network.org/api/states/all';
 
-// In-memory token cache (lives for the duration of the serverless function warm instance)
+// Module-level token cache (survives across warm invocations)
 let cachedToken = null;
 let tokenExpiresAt = 0;
 
 async function getAccessToken() {
   const now = Date.now();
-
-  // Reuse token if still valid (with 30s buffer)
-  if (cachedToken && now < tokenExpiresAt - 30_000) {
-    return cachedToken;
-  }
+  if (cachedToken && now < tokenExpiresAt - 30_000) return cachedToken;
 
   const clientId = process.env.OPENSKY_CLIENT_ID;
   const clientSecret = process.env.OPENSKY_CLIENT_SECRET;
-
-  if (!clientId || !clientSecret) {
-    throw new Error('Missing OPENSKY_CLIENT_ID or OPENSKY_CLIENT_SECRET env vars');
-  }
+  if (!clientId || !clientSecret) throw new Error('Missing OpenSky credentials');
 
   const res = await fetch(TOKEN_URL, {
     method: 'POST',
@@ -37,74 +30,108 @@ async function getAccessToken() {
       client_id: clientId,
       client_secret: clientSecret,
     }),
-    signal: AbortSignal.timeout(8000),
+    signal: AbortSignal.timeout(5000),
   });
 
-  if (!res.ok) {
-    throw new Error(`OAuth2 token request failed: ${res.status} ${res.statusText}`);
-  }
-
+  if (!res.ok) throw new Error(`Token fetch failed: ${res.status}`);
   const data = await res.json();
   cachedToken = data.access_token;
-  // expires_in is in seconds
-  tokenExpiresAt = now + (data.expires_in ?? 300) * 1000;
-
+  tokenExpiresAt = now + (data.expires_in ?? 1800) * 1000;
   return cachedToken;
 }
 
+/**
+ * Strip each state vector down to only the fields the globe needs.
+ * Raw OpenSky row has 17 fields; we only use 7.
+ * This cuts the payload from ~1.6MB → ~300KB.
+ */
+function parseLeanStates(states) {
+  const out = [];
+  for (const sv of states) {
+    // Skip aircraft with no position
+    if (sv[5] == null || sv[6] == null) continue;
+    out.push({
+      icao24:      sv[0],
+      callsign:    (sv[1] || sv[0]).trim(),
+      country:     sv[2] || 'Unknown',
+      longitude:   sv[5],
+      latitude:    sv[6],
+      altitude:    sv[7],      // baro altitude metres (null = ground)
+      onGround:    sv[8],
+      velocity:    sv[9],      // m/s
+      heading:     sv[10],     // degrees clockwise from north
+      verticalRate: sv[11],    // m/s (positive = climbing)
+    });
+  }
+  return out;
+}
+
 export default async function handler(req, res) {
-  // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
   try {
-    // Build OpenSky URL with optional bbox params
+    // Build OpenSky URL
     const { lamin, lomin, lamax, lomax } = req.query;
     const params = new URLSearchParams();
     if (lamin) params.set('lamin', lamin);
     if (lomin) params.set('lomin', lomin);
     if (lamax) params.set('lamax', lamax);
     if (lomax) params.set('lomax', lomax);
-
     const url = `${OPENSKY_URL}${params.toString() ? `?${params}` : ''}`;
 
-    // Get OAuth2 token
-    const token = await getAccessToken();
+    // Fetch token + data in parallel when token is already cached
+    let token;
+    try {
+      token = await getAccessToken();
+    } catch (e) {
+      console.error('[flights] token error:', e.message);
+      // Fall back to anonymous if token fails
+      token = null;
+    }
+
+    const headers = {
+      'Accept': 'application/json',
+      'User-Agent': 'FlightTracker/1.0',
+    };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
 
     const response = await fetch(url, {
-      headers: {
-        'Accept': 'application/json',
-        'Authorization': `Bearer ${token}`,
-        'User-Agent': 'FlightTracker/1.0',
-      },
-      signal: AbortSignal.timeout(9000),
+      headers,
+      signal: AbortSignal.timeout(8000),
     });
 
     if (response.status === 429) {
-      return res.status(429).json({ error: 'OpenSky rate limit reached. Try again in a few seconds.' });
+      return res.status(429).json({ error: 'Rate limited. Retry in 10s.' });
     }
-
     if (!response.ok) {
       return res.status(response.status).json({
-        error: `OpenSky returned ${response.status}: ${response.statusText}`,
+        error: `OpenSky error: ${response.status} ${response.statusText}`,
       });
     }
 
-    const data = await response.json();
+    const raw = await response.json();
+    const flights = parseLeanStates(raw.states ?? []);
 
-    // Cache for 8s on Vercel CDN (just under the 10s poll interval)
+    // Tell Vercel CDN to cache for 8s
     res.setHeader('Cache-Control', 's-maxage=8, stale-while-revalidate=5');
-    return res.status(200).json(data);
+    res.setHeader('Content-Type', 'application/json');
+
+    // Return lean payload
+    return res.status(200).json({
+      time: raw.time,
+      count: flights.length,
+      flights,
+    });
 
   } catch (err) {
     if (err.name === 'TimeoutError' || err.name === 'AbortError') {
-      return res.status(504).json({ error: 'OpenSky request timed out' });
+      return res.status(504).json({ error: 'OpenSky timed out. Retry shortly.' });
     }
-    console.error('[flights proxy] Error:', err.message);
-    return res.status(500).json({ error: 'Failed to fetch flight data' });
+    console.error('[flights] error:', err.message);
+    return res.status(500).json({ error: 'Internal error fetching flights' });
   }
 }

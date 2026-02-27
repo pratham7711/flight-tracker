@@ -1,34 +1,24 @@
 /**
- * Vercel serverless function — OpenSky Network proxy
- * Fetches 4 global regions in PARALLEL to beat the 10s timeout.
- * Each bbox request is ~300KB vs 1.6MB for global — 4 parallel = ~3s total.
+ * Vercel Edge Function — OpenSky Network proxy
+ * Runs on Cloudflare/edge network (not blocked by OpenSky like AWS Lambda IPs)
+ * OAuth2 client credentials | 4 parallel regions | lean payload
  */
 
-export const maxDuration = 25;
+export const config = { runtime: 'edge' };
 
 const TOKEN_URL =
   'https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token';
 const OPENSKY_BASE = 'https://opensky-network.org/api/states/all';
 
-// 4 non-overlapping bboxes that cover the whole world
+// 4 non-overlapping bboxes covering the whole world
 const REGIONS = [
-  { lamin: -90, lomin: -180, lamax:  90, lomax:  -90 }, // Americas
-  { lamin: -90, lomin:  -90, lamax:  90, lomax:    0 }, // Atlantic + W Africa
-  { lamin: -90, lomin:    0, lamax:  90, lomax:   90 }, // Europe + Africa + Middle East
-  { lamin: -90, lomin:   90, lamax:  90, lomax:  180 }, // Asia + Pacific
+  { lamin: -90, lomin: -180, lamax: 90, lomax:  -90 }, // Americas
+  { lamin: -90, lomin:  -90, lamax: 90, lomax:    0 }, // Atlantic + W Africa
+  { lamin: -90, lomin:    0, lamax: 90, lomax:   90 }, // Europe + Africa
+  { lamin: -90, lomin:   90, lamax: 90, lomax:  180 }, // Asia + Pacific
 ];
 
-let cachedToken = null;
-let tokenExpiresAt = 0;
-
-async function getAccessToken() {
-  const now = Date.now();
-  if (cachedToken && now < tokenExpiresAt - 30_000) return cachedToken;
-
-  const clientId = process.env.OPENSKY_CLIENT_ID;
-  const clientSecret = process.env.OPENSKY_CLIENT_SECRET;
-  if (!clientId || !clientSecret) throw new Error('Missing OpenSky credentials');
-
+async function getToken(clientId, clientSecret) {
   const res = await fetch(TOKEN_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -37,14 +27,10 @@ async function getAccessToken() {
       client_id: clientId,
       client_secret: clientSecret,
     }),
-    signal: AbortSignal.timeout(6000),
   });
-
   if (!res.ok) throw new Error(`Token ${res.status}`);
   const d = await res.json();
-  cachedToken = d.access_token;
-  tokenExpiresAt = Date.now() + (d.expires_in ?? 1800) * 1000;
-  return cachedToken;
+  return d.access_token;
 }
 
 function parseLean(states) {
@@ -68,58 +54,63 @@ function parseLean(states) {
 }
 
 async function fetchRegion(token, region) {
-  const params = new URLSearchParams({
-    lamin: region.lamin,
-    lomin: region.lomin,
-    lamax: region.lamax,
-    lomax: region.lomax,
-  });
-  const url = `${OPENSKY_BASE}?${params}`;
+  const params = new URLSearchParams(Object.entries(region).map(([k, v]) => [k, String(v)]));
   const headers = { 'Accept': 'application/json', 'User-Agent': 'FlightTracker/1.0' };
   if (token) headers['Authorization'] = `Bearer ${token}`;
-
-  const res = await fetch(url, { headers, signal: AbortSignal.timeout(18000) });
-  if (!res.ok) throw new Error(`OpenSky ${res.status} for region ${JSON.stringify(region)}`);
+  const res = await fetch(`${OPENSKY_BASE}?${params}`, { headers });
+  if (!res.ok) throw new Error(`OpenSky ${res.status}`);
   const raw = await res.json();
-  return { time: raw.time, states: raw.states ?? [] };
+  return { time: raw.time ?? 0, states: raw.states ?? [] };
 }
 
-export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
+export default async function handler(req) {
+  // CORS preflight
+  if (req.method === 'OPTIONS') {
+    return new Response(null, {
+      status: 200,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
+      },
+    });
+  }
+
+  if (req.method !== 'GET') {
+    return new Response(JSON.stringify({ error: 'Method not allowed' }), { status: 405 });
+  }
 
   try {
-    // Get token (falls back to anonymous)
+    const clientId = process.env.OPENSKY_CLIENT_ID;
+    const clientSecret = process.env.OPENSKY_CLIENT_SECRET;
+
+    // Get token (fall back to anon if creds missing)
     let token = null;
-    try { token = await getAccessToken(); } catch (e) {
-      console.warn('[flights] token err, using anon:', e.message);
+    if (clientId && clientSecret) {
+      try { token = await getToken(clientId, clientSecret); } catch (e) {
+        console.warn('Token error, using anon:', e.message);
+      }
     }
 
-    const { lamin, lomin, lamax, lomax } = req.query;
+    // Parse optional custom bbox from query
+    const url = new URL(req.url);
+    const lamin = url.searchParams.get('lamin');
+    const lomin = url.searchParams.get('lomin');
+    const lamax = url.searchParams.get('lamax');
+    const lomax = url.searchParams.get('lomax');
+
     let results;
-
     if (lamin && lomin && lamax && lomax) {
-      // Single custom bbox
-      const params = new URLSearchParams({ lamin, lomin, lamax, lomax });
-      const headers = { 'Accept': 'application/json', 'User-Agent': 'FlightTracker/1.0' };
-      if (token) headers['Authorization'] = `Bearer ${token}`;
-      const r = await fetch(`${OPENSKY_BASE}?${params}`, { headers, signal: AbortSignal.timeout(18000) });
-      if (!r.ok) throw new Error(`OpenSky ${r.status}`);
-      const raw = await r.json();
-      results = [{ time: raw.time, states: raw.states ?? [] }];
+      results = [await fetchRegion(token, { lamin, lomin, lamax, lomax })];
     } else {
-      // Fetch all 4 regions in parallel
-      results = await Promise.all(REGIONS.map(region => fetchRegion(token, region)));
+      // Parallel fetch all 4 regions
+      results = await Promise.all(REGIONS.map(r => fetchRegion(token, r)));
     }
 
-    // Merge + deduplicate by icao24
+    // Merge + deduplicate
     const seen = new Set();
     const allStates = [];
     let latestTime = 0;
-
     for (const { time, states } of results) {
       if (time > latestTime) latestTime = time;
       for (const sv of states) {
@@ -131,16 +122,25 @@ export default async function handler(req, res) {
     }
 
     const flights = parseLean(allStates);
+    const body = JSON.stringify({ time: latestTime, count: flights.length, flights });
 
-    res.setHeader('Cache-Control', 's-maxage=8, stale-while-revalidate=5');
-    res.setHeader('Content-Type', 'application/json');
-    return res.status(200).json({ time: latestTime, count: flights.length, flights });
+    return new Response(body, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 's-maxage=8, stale-while-revalidate=5',
+      },
+    });
 
   } catch (err) {
-    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
-      return res.status(504).json({ error: 'OpenSky timed out.' });
-    }
-    console.error('[flights] error:', err.message);
-    return res.status(500).json({ error: err.message });
+    console.error('[flights edge] error:', err.message);
+    return new Response(JSON.stringify({ error: err.message }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
   }
 }

@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 
 const POLL_INTERVAL_MS = 10_000; // 10s — OpenSky anonymous rate limit
-const OPENSKY_URL = '/api/opensky/states/all';
+// In production: calls Vercel serverless function /api/flights (CORS proxy)
+// In dev: same path works via direct call (Vite dev server is node so no CORS issues)
+const OPENSKY_URL = '/api/flights';
 
 /**
  * OpenSky state vector field indices:
